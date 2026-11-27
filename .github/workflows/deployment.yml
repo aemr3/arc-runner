@@ -4,6 +4,8 @@ on:
     branches:
       - main
   workflow_dispatch:
+  schedule:
+    - cron: "15 4 * * *"
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
 permissions:
@@ -12,24 +14,49 @@ permissions:
 jobs:
   build:
     name: Build
+    if: github.ref == 'refs/heads/main'
+    env:
+      BASE_IMAGE: ghcr.io/actions/actions-runner:latest
+      RUNNER_IMAGE: ghcr.io/${{ github.repository }}:latest
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v7
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Check the base image
+        id: base
+        run: |
+          digest=$(docker buildx imagetools inspect "$BASE_IMAGE" --format '{{json .Manifest}}' | jq -er '.digest')
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_EVENT_NAME" == schedule ]] &&
+             docker buildx imagetools inspect "$RUNNER_IMAGE" --raw |
+               jq -e --arg digest "$digest" '.annotations["org.opencontainers.image.base.digest"] == $digest' > /dev/null; then
+            echo "The published runner already uses $digest"
+          else
+            echo "rebuild=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Set up QEMU
+        if: steps.base.outputs.rebuild == 'true'
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm64
+      - name: Set up Docker Buildx
+        if: steps.base.outputs.rebuild == 'true'
+        uses: docker/setup-buildx-action@v4
       - name: Build and push
+        if: steps.base.outputs.rebuild == 'true'
         uses: docker/build-push-action@v7
         with:
           context: .
           push: true
-          tags: ghcr.io/${{ github.repository }}
+          tags: ${{ env.RUNNER_IMAGE }}
+          build-args: RUNNER_BASE=${{ env.BASE_IMAGE }}@${{ steps.base.outputs.digest }}
+          annotations: index:org.opencontainers.image.base.digest=${{ steps.base.outputs.digest }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           platforms: linux/amd64,linux/arm64
